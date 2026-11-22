@@ -36,9 +36,9 @@ jobs:
           cache: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Verify Go modules
         run: go mod verify
@@ -56,7 +56,7 @@ jobs:
         run: go vet ./...
 
       - name: Run JS WebCrypto & DOM tests
-        run: node --test extension/test/e2ee.test.mjs extension/test/content.test.mjs
+        run: node --test extension/test/e2ee.test.mjs extension/test/content.test.mjs extension/test/background.test.mjs
 
       - name: Run Go unit, race & cross-language E2EE tests
         env:

@@ -20,6 +20,7 @@ import {
   generateSessionID,
   generateSessionKey,
   handshakeKey,
+  hexToBytes,
   utf8Decode,
   utf8Encode,
   verifyAgentHandshake,
@@ -27,11 +28,18 @@ import {
 
 const KEEPALIVE_INTERVAL_MS = 20_000;
 const WS_CONNECT_TIMEOUT_MS = 10_000;
+const RECONNECT_BASE_DELAY_MS = 1_000;
+const RECONNECT_MAX_DELAY_MS = 5_000;
+const RECONNECT_JITTER_FRACTION = 0.2;
+const WATCHDOG_ALARM_NAME = "dtfm-web-keepalive-watchdog";
+const WATCHDOG_PERIOD_MINUTES = 0.5;
 const STORAGE_RELAY_URL_KEY = "dtfm_web_relay_url";
+const STORAGE_SESSION_KEY = "dtfm_web_active_session";
 
 const state = {
   active: false,
   connected: false,
+  reconnecting: false,
   tabId: null,
   windowId: null,
   tabTitle: "",
@@ -43,13 +51,41 @@ const state = {
   keyHex: null,
   secretKey: null,
   hk: null,
+  authFrame: null,
   ws: null,
   keepaliveTimer: null,
   connectTimer: null,
+  reconnectTimer: null,
+  reconnectAttempts: 0,
+  connGen: 0,
   pendingFinish: null,
   activeAgent: null, // { connID: bigint, opNonce: Uint8Array|null, cipher: ConnCipher|null, chain: Promise }
   lastError: null,
 };
+
+let restoreInFlight = null;
+
+/**
+ * Classifies WebSocket close codes into permanent (no auto-reconnect) vs transient.
+ * @param {number} code
+ * @returns {boolean}
+ */
+export function isPermanentCloseCode(code) {
+  return code === 1000 || code === 4000 || code === 4003;
+}
+
+/**
+ * Computes jittered exponential backoff delay in milliseconds (1s -> 2s -> 4s -> cap 5s, +/-20% jitter).
+ * @param {number} attempt
+ * @param {() => number} [randomFn]
+ * @returns {number}
+ */
+export function computeReconnectDelay(attempt, randomFn = Math.random) {
+  const exp = Math.min(Math.max(0, attempt), 10);
+  const base = Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * (2 ** exp));
+  const jitterFactor = 1 + RECONNECT_JITTER_FRACTION * (2 * randomFn() - 1);
+  return Math.round(base * jitterFactor);
+}
 
 function isLoopbackHostname(hostname) {
   const host = (hostname || "").toLowerCase();
@@ -116,6 +152,7 @@ function getPublicState() {
   return {
     active: state.active,
     connected: state.connected,
+    reconnecting: state.reconnecting,
     tabId: state.tabId,
     tabTitle: state.tabTitle,
     tabUrl: state.tabUrl,
@@ -135,6 +172,15 @@ async function setLiveBadge(tabId) {
   }
 }
 
+async function setReconnectingBadge(tabId) {
+  try {
+    await chrome.action.setBadgeText({ text: "...", tabId });
+    await chrome.action.setBadgeBackgroundColor({ color: "#d97706", tabId });
+  } catch (_) {
+    // Tab may have closed.
+  }
+}
+
 async function clearLiveBadge(tabId) {
   try {
     if (typeof tabId === "number") {
@@ -146,7 +192,58 @@ async function clearLiveBadge(tabId) {
   }
 }
 
-async function stopSharing(reason = null) {
+async function saveSessionToStorage() {
+  if (!chrome?.storage?.session || !state.active || !state.sessionID || !state.keyHex) {
+    return;
+  }
+  try {
+    await chrome.storage.session.set({
+      [STORAGE_SESSION_KEY]: {
+        tabId: state.tabId,
+        windowId: state.windowId,
+        tabTitle: state.tabTitle,
+        tabUrl: state.tabUrl,
+        origin: state.origin,
+        originPattern: state.originPattern,
+        relayUrl: state.relayUrl,
+        sessionID: state.sessionID,
+        keyHex: state.keyHex,
+      },
+    });
+  } catch (_) {
+    // Ignore session storage write errors.
+  }
+}
+
+async function clearSessionStorage() {
+  if (!chrome?.storage?.session) return;
+  try {
+    await chrome.storage.session.remove(STORAGE_SESSION_KEY);
+  } catch (_) {
+    // Ignore session storage remove errors.
+  }
+}
+
+async function ensureWatchdogAlarm() {
+  if (!chrome?.alarms) return;
+  try {
+    await chrome.alarms.create(WATCHDOG_ALARM_NAME, { periodInMinutes: WATCHDOG_PERIOD_MINUTES });
+  } catch (_) {
+    // Ignore alarm creation errors.
+  }
+}
+
+async function clearWatchdogAlarm() {
+  if (!chrome?.alarms) return;
+  try {
+    await chrome.alarms.clear(WATCHDOG_ALARM_NAME);
+  } catch (_) {
+    // Ignore alarm clear errors.
+  }
+}
+
+async function stopSharingInternal(reason = null) {
+  state.connGen += 1;
   const prevTabId = state.tabId;
   const prevOriginPattern = state.originPattern;
   const prevWs = state.ws;
@@ -160,11 +257,17 @@ async function stopSharing(reason = null) {
     clearTimeout(state.connectTimer);
     state.connectTimer = null;
   }
+  if (state.reconnectTimer !== null) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
 
   state.ws = null;
   state.pendingFinish = null;
   state.active = false;
   state.connected = false;
+  state.reconnecting = false;
+  state.reconnectAttempts = 0;
   state.tabId = null;
   state.windowId = null;
   state.tabTitle = "";
@@ -184,8 +287,16 @@ async function stopSharing(reason = null) {
     state.hk.fill(0);
     state.hk = null;
   }
+  if (state.authFrame) {
+    state.authFrame.fill(0);
+    state.authFrame = null;
+  }
 
   if (prevWs) {
+    prevWs.onopen = null;
+    prevWs.onclose = null;
+    prevWs.onerror = null;
+    prevWs.onmessage = null;
     try {
       prevWs.close(1000, "operator stopped sharing");
     } catch (_) {
@@ -193,12 +304,22 @@ async function stopSharing(reason = null) {
     }
   }
 
+  await clearSessionStorage();
+  await clearWatchdogAlarm();
   await clearLiveBadge(prevTabId);
   await revokeOriginPermission(prevOriginPattern);
 
   if (prevFinish) {
     prevFinish();
   }
+}
+
+async function stopSharing(reason = null) {
+  state.connGen += 1;
+  if (restoreInFlight) {
+    await restoreInFlight.catch(() => {});
+  }
+  await stopSharingInternal(reason);
 }
 
 function sendKickAgent(ws, connID) {
@@ -546,6 +667,232 @@ function handleRelayMessage(ws, data) {
   }
 }
 
+function scheduleReconnect(gen) {
+  if (!state.active || gen !== state.connGen) {
+    return;
+  }
+
+  if (state.keepaliveTimer !== null) {
+    clearInterval(state.keepaliveTimer);
+    state.keepaliveTimer = null;
+  }
+  if (state.connectTimer !== null) {
+    clearTimeout(state.connectTimer);
+    state.connectTimer = null;
+  }
+  if (state.reconnectTimer !== null) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+
+  state.connected = false;
+  state.reconnecting = true;
+  state.activeAgent = null;
+  state.ws = null;
+
+  setReconnectingBadge(state.tabId);
+
+  const delay = computeReconnectDelay(state.reconnectAttempts);
+  state.reconnectAttempts += 1;
+
+  state.reconnectTimer = setTimeout(async () => {
+    state.reconnectTimer = null;
+    if (!state.active || gen !== state.connGen) {
+      return;
+    }
+
+    try {
+      await chrome.tabs.get(state.tabId);
+    } catch (_) {
+      if (state.active && gen === state.connGen) {
+        await stopSharing("Shared tab was closed");
+      }
+      return;
+    }
+
+    if (!state.active || gen !== state.connGen) {
+      return;
+    }
+
+    openRelaySocket({ isInitial: false });
+  }, delay);
+}
+
+function openRelaySocket({ isInitial = false } = {}) {
+  if (!state.active || !state.sessionID) {
+    return Promise.resolve(getPublicState());
+  }
+
+  state.connGen += 1;
+  const gen = state.connGen;
+
+  if (state.keepaliveTimer !== null) {
+    clearInterval(state.keepaliveTimer);
+    state.keepaliveTimer = null;
+  }
+  if (state.connectTimer !== null) {
+    clearTimeout(state.connectTimer);
+    state.connectTimer = null;
+  }
+  if (state.reconnectTimer !== null) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+  }
+
+  const wsUrl = new URL(state.relayUrl);
+  wsUrl.searchParams.set("session", state.sessionID);
+  wsUrl.searchParams.set("role", ROLE_OPERATOR);
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (!settled) {
+        settled = true;
+        if (state.pendingFinish === finish) {
+          state.pendingFinish = null;
+        }
+        resolve(getPublicState());
+      }
+    };
+    if (isInitial) {
+      state.pendingFinish = finish;
+    }
+
+    let ws;
+    try {
+      ws = new WebSocket(wsUrl.toString());
+      ws.binaryType = "arraybuffer";
+    } catch (err) {
+      if (isInitial) {
+        stopSharing(`Failed to open relay WebSocket: ${err.message}`).finally(finish);
+      } else {
+        scheduleReconnect(gen);
+        finish();
+      }
+      return;
+    }
+    state.ws = ws;
+
+    let hadError = false;
+    let timedOut = false;
+    let hasOpened = false;
+
+    state.connectTimer = setTimeout(() => {
+      if (gen !== state.connGen || !state.active || state.ws !== ws || ws.readyState === WebSocket.OPEN) {
+        return;
+      }
+      state.connectTimer = null;
+      state.ws = null;
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
+      try {
+        ws.close();
+      } catch (_) {
+        // Ignore close errors.
+      }
+      if (isInitial) {
+        stopSharing("Relay WebSocket connection timed out").finally(finish);
+      } else {
+        scheduleReconnect(gen);
+        finish();
+      }
+    }, WS_CONNECT_TIMEOUT_MS);
+
+    ws.onopen = () => {
+      if (gen !== state.connGen || !state.active || ws !== state.ws) {
+        try {
+          ws.close();
+        } catch (_) {
+          // Ignore close errors.
+        }
+        finish();
+        return;
+      }
+      if (state.connectTimer !== null) {
+        clearTimeout(state.connectTimer);
+        state.connectTimer = null;
+      }
+      hasOpened = true;
+      ws.send(state.authFrame);
+      state.connected = true;
+      state.reconnecting = false;
+      state.reconnectAttempts = 0;
+      state.lastError = null;
+
+      // Set LIVE badge only once relay connection is established.
+      setLiveBadge(state.tabId);
+
+      // 1-byte keepalive every 20s keeps MV3 service worker awake, refreshes relay idle timer,
+      // and verifies the pinned tab is still open.
+      state.keepaliveTimer = setInterval(() => {
+        if (gen !== state.connGen || !state.active || state.ws !== ws || ws.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        ws.send(new Uint8Array([FRAME_KEEPALIVE]));
+        chrome.tabs.get(state.tabId).catch(() => {
+          if (state.active && state.connGen === gen) {
+            stopSharing("Shared tab was closed");
+          }
+        });
+      }, KEEPALIVE_INTERVAL_MS);
+
+      Promise.all([saveSessionToStorage(), ensureWatchdogAlarm()]).finally(finish);
+    };
+
+    ws.onmessage = (event) => {
+      if (gen !== state.connGen || !state.active || ws !== state.ws) {
+        return;
+      }
+      handleRelayMessage(ws, event.data);
+    };
+
+    ws.onerror = () => {
+      if (gen !== state.connGen || !state.active || ws !== state.ws) {
+        return;
+      }
+      hadError = true;
+    };
+
+    ws.onclose = (event) => {
+      if (gen !== state.connGen || !state.active || ws !== state.ws) {
+        finish();
+        return;
+      }
+      if (state.connectTimer !== null) {
+        clearTimeout(state.connectTimer);
+        state.connectTimer = null;
+      }
+      if (state.keepaliveTimer !== null) {
+        clearInterval(state.keepaliveTimer);
+        state.keepaliveTimer = null;
+      }
+
+      const code = event?.code ?? 1006;
+      if ((isInitial && !hasOpened) || isPermanentCloseCode(code)) {
+        let reason = null;
+        if (timedOut) {
+          reason = "Relay WebSocket connection timed out";
+        } else if (code !== 1000) {
+          reason = hadError
+            ? `Relay WebSocket connection failed (code ${code})`
+            : `Relay disconnected (code ${code}${event?.reason ? `: ${event.reason}` : ""})`;
+        }
+        stopSharing(reason).finally(finish);
+        return;
+      }
+
+      scheduleReconnect(gen);
+      finish();
+    };
+
+    if (!isInitial) {
+      finish();
+    }
+  });
+}
+
 async function startSharing({ tabId, windowId, tabTitle, tabUrl, origin, relayUrl }) {
   await stopSharing(null);
 
@@ -583,12 +930,10 @@ async function startSharing({ tabId, windowId, tabTitle, tabUrl, origin, relayUr
     return getPublicState();
   }
 
-  const wsUrl = new URL(normalizedRelay);
-  wsUrl.searchParams.set("session", sessionID);
-  wsUrl.searchParams.set("role", ROLE_OPERATOR);
-
   state.active = true;
   state.connected = false;
+  state.reconnecting = false;
+  state.reconnectAttempts = 0;
   state.tabId = tabId;
   state.windowId = windowId;
   state.tabTitle = tabTitle || "";
@@ -599,140 +944,244 @@ async function startSharing({ tabId, windowId, tabTitle, tabUrl, origin, relayUr
   state.keyHex = keyHex;
   state.secretKey = secretKey;
   state.hk = hk;
+  state.authFrame = authFrame;
   state.activeAgent = null;
   state.lastError = null;
 
-  let ws;
-  try {
-    ws = new WebSocket(wsUrl.toString());
-    ws.binaryType = "arraybuffer";
-  } catch (err) {
-    await stopSharing(`Failed to open relay WebSocket: ${err.message}`);
-    return getPublicState();
-  }
-  state.ws = ws;
-
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (!settled) {
-        settled = true;
-        if (state.pendingFinish === finish) {
-          state.pendingFinish = null;
-        }
-        resolve(getPublicState());
-      }
-    };
-    state.pendingFinish = finish;
-
-    let hadError = false;
-    let timedOut = false;
-
-    state.connectTimer = setTimeout(() => {
-      if (state.ws === ws && ws.readyState !== WebSocket.OPEN) {
-        timedOut = true;
-        try {
-          ws.close();
-        } catch (_) {
-          // Ignore close errors.
-        }
-        stopSharing("Relay WebSocket connection timed out").finally(finish);
-      }
-    }, WS_CONNECT_TIMEOUT_MS);
-
-    ws.onopen = () => {
-      if (ws !== state.ws) {
-        ws.close();
-        finish();
-        return;
-      }
-      if (state.connectTimer !== null) {
-        clearTimeout(state.connectTimer);
-        state.connectTimer = null;
-      }
-      ws.send(authFrame);
-      state.connected = true;
-      state.lastError = null;
-
-      // Set LIVE badge only once relay connection is established.
-      setLiveBadge(tabId);
-
-      // 1-byte keepalive every 20s keeps MV3 service worker awake and refreshes relay idle timer.
-      state.keepaliveTimer = setInterval(() => {
-        if (state.ws === ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(new Uint8Array([FRAME_KEEPALIVE]));
-        }
-      }, KEEPALIVE_INTERVAL_MS);
-
-      finish();
-    };
-
-    ws.onmessage = (event) => {
-      handleRelayMessage(ws, event.data);
-    };
-
-    ws.onerror = () => {
-      if (ws !== state.ws) return;
-      hadError = true;
-    };
-
-    ws.onclose = (event) => {
-      if (ws !== state.ws) {
-        finish();
-        return;
-      }
-      let reason = null;
-      if (timedOut) {
-        reason = "Relay WebSocket connection timed out";
-      } else if (event.code !== 1000) {
-        reason = hadError
-          ? `Relay WebSocket connection failed (code ${event.code})`
-          : `Relay disconnected (code ${event.code}${event.reason ? `: ${event.reason}` : ""})`;
-      }
-      stopSharing(reason).finally(finish);
-    };
-  });
+  return openRelaySocket({ isInitial: true });
 }
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  if (state.active && state.tabId === tabId) {
-    stopSharing("Shared tab was closed");
-  }
-});
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  // Restrict messages strictly to this extension's own UI pages (popup), never content scripts or external senders.
-  if (!sender || sender.id !== chrome.runtime.id || sender.tab) {
-    return;
+/**
+ * Idempotently restores an active sharing session from RAM-only chrome.storage.session
+ * after MV3 service worker hibernation, or ensures an active session's socket is healthy.
+ */
+export async function ensureRestored() {
+  if (restoreInFlight) {
+    return restoreInFlight;
   }
 
-  (async () => {
-    if (!msg || typeof msg.type !== "string") {
-      sendResponse({ error: "invalid message" });
-      return;
+  restoreInFlight = (async () => {
+    const gen = state.connGen;
+    const isAborted = () => state.connGen !== gen || state.active;
+
+    if (state.active) {
+      if (
+        !state.connected &&
+        !state.reconnecting &&
+        state.reconnectTimer === null &&
+        (!state.ws || state.ws.readyState === WebSocket.CLOSED)
+      ) {
+        scheduleReconnect(state.connGen);
+      }
+      return getPublicState();
     }
 
-    if (msg.type === "GET_STATE") {
-      await loadSavedRelayUrl();
-      sendResponse(getPublicState());
-      return;
+    if (!chrome?.storage?.session) {
+      return getPublicState();
     }
 
-    if (msg.type === "START_SHARING") {
-      const result = await startSharing(msg);
-      sendResponse(result);
-      return;
+    let data;
+    try {
+      data = await chrome.storage.session.get(STORAGE_SESSION_KEY);
+    } catch (_) {
+      return getPublicState();
+    }
+    if (isAborted()) {
+      return getPublicState();
     }
 
-    if (msg.type === "STOP_SHARING") {
-      await stopSharing(null);
-      sendResponse(getPublicState());
-      return;
+    const saved = data?.[STORAGE_SESSION_KEY];
+    let normalizedRelay = null;
+    if (saved && typeof saved.relayUrl === "string") {
+      try {
+        normalizedRelay = validateRelayUrl(saved.relayUrl);
+      } catch (_) {
+        normalizedRelay = null;
+      }
+    }
+    if (
+      !saved ||
+      typeof saved.tabId !== "number" ||
+      typeof saved.sessionID !== "string" ||
+      typeof saved.keyHex !== "string" ||
+      typeof saved.origin !== "string" ||
+      saved.origin.length === 0 ||
+      saved.originPattern !== `${saved.origin}/*` ||
+      !normalizedRelay
+    ) {
+      if (saved) {
+        await clearSessionStorage();
+      }
+      return getPublicState();
     }
 
-    sendResponse({ error: `unknown message type: ${msg.type}` });
-  })().catch((err) => {
-    sendResponse({ error: err.message });
+    try {
+      await chrome.tabs.get(saved.tabId);
+    } catch (_) {
+      if (isAborted()) {
+        return getPublicState();
+      }
+      state.tabId = saved.tabId;
+      state.originPattern = saved.originPattern;
+      await stopSharingInternal("Shared tab was closed");
+      return getPublicState();
+    }
+    if (isAborted()) {
+      return getPublicState();
+    }
+
+    if (chrome?.permissions?.contains) {
+      let hasPerm = false;
+      try {
+        hasPerm = await chrome.permissions.contains({ origins: [saved.originPattern] });
+      } catch (_) {
+        hasPerm = false;
+      }
+      if (isAborted()) {
+        return getPublicState();
+      }
+      if (!hasPerm) {
+        state.tabId = saved.tabId;
+        state.originPattern = saved.originPattern;
+        await stopSharingInternal("Host permission was revoked");
+        return getPublicState();
+      }
+    }
+
+    let secretKey;
+    let hk;
+    let authFrame;
+    const zeroizeLocals = () => {
+      if (secretKey) secretKey.fill(0);
+      if (hk) hk.fill(0);
+      if (authFrame) authFrame.fill(0);
+    };
+    try {
+      secretKey = hexToBytes(saved.keyHex);
+      const { opAuth, agentVerifier } = await deriveAuthTokens(secretKey, saved.sessionID);
+      if (isAborted()) {
+        zeroizeLocals();
+        return getPublicState();
+      }
+      hk = await handshakeKey(secretKey, saved.sessionID);
+      if (isAborted()) {
+        zeroizeLocals();
+        return getPublicState();
+      }
+      authFrame = buildOperatorAuthFrame(opAuth, agentVerifier);
+    } catch (_) {
+      zeroizeLocals();
+      if (isAborted()) {
+        return getPublicState();
+      }
+      state.tabId = saved.tabId;
+      state.originPattern = saved.originPattern;
+      await stopSharingInternal("Failed to restore E2EE session");
+      return getPublicState();
+    }
+
+    state.active = true;
+    state.connected = false;
+    state.reconnecting = true;
+    state.reconnectAttempts = 0;
+    state.tabId = saved.tabId;
+    state.windowId = saved.windowId ?? null;
+    state.tabTitle = saved.tabTitle || "";
+    state.tabUrl = saved.tabUrl || "";
+    state.origin = saved.origin;
+    state.originPattern = saved.originPattern;
+    state.relayUrl = normalizedRelay;
+    state.sessionID = saved.sessionID;
+    state.keyHex = saved.keyHex;
+    state.secretKey = secretKey;
+    state.hk = hk;
+    state.authFrame = authFrame;
+    state.activeAgent = null;
+    state.lastError = null;
+
+    await ensureWatchdogAlarm();
+    if (state.connGen !== gen || !state.active) {
+      return getPublicState();
+    }
+    await setReconnectingBadge(state.tabId);
+    if (state.connGen !== gen || !state.active) {
+      return getPublicState();
+    }
+    openRelaySocket({ isInitial: false });
+    return getPublicState();
+  })().finally(() => {
+    restoreInFlight = null;
   });
-  return true;
-});
+
+  return restoreInFlight;
+}
+
+export {
+  getPublicState,
+  startSharing,
+  state,
+  stopSharing,
+};
+
+if (typeof chrome !== "undefined" && chrome.tabs && chrome.runtime) {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    (async () => {
+      if (restoreInFlight) {
+        await restoreInFlight.catch(() => {});
+      }
+      if (state.active && state.tabId === tabId) {
+        await stopSharing("Shared tab was closed");
+      }
+    })();
+  });
+
+  if (chrome.alarms?.onAlarm) {
+    chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm?.name === WATCHDOG_ALARM_NAME) {
+        ensureRestored();
+      }
+    });
+  }
+
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    // Restrict messages strictly to this extension's own UI pages (popup), never content scripts or external senders.
+    if (!sender || sender.id !== chrome.runtime.id || sender.tab) {
+      return;
+    }
+
+    (async () => {
+      if (!msg || typeof msg.type !== "string") {
+        sendResponse({ error: "invalid message" });
+        return;
+      }
+
+      if (msg.type === "GET_STATE") {
+        await ensureRestored();
+        if (!state.active) {
+          await loadSavedRelayUrl();
+        }
+        sendResponse(getPublicState());
+        return;
+      }
+
+      if (msg.type === "START_SHARING") {
+        const result = await startSharing(msg);
+        sendResponse(result);
+        return;
+      }
+
+      if (msg.type === "STOP_SHARING") {
+        await stopSharing(null);
+        sendResponse(getPublicState());
+        return;
+      }
+
+      sendResponse({ error: `unknown message type: ${msg.type}` });
+    })().catch((err) => {
+      sendResponse({ error: err.message });
+    });
+    return true;
+  });
+
+  ensureRestored();
+}

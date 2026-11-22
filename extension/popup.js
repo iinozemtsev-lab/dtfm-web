@@ -31,8 +31,16 @@ function renderState(state) {
   }
 
   if (state.active) {
-    statusBadge.textContent = state.connected ? "LIVE" : "CONNECTING";
-    statusBadge.className = "badge live";
+    if (state.connected) {
+      statusBadge.textContent = "LIVE";
+      statusBadge.className = "badge live";
+    } else if (state.reconnecting) {
+      statusBadge.textContent = "RECONNECTING";
+      statusBadge.className = "badge reconnecting";
+    } else {
+      statusBadge.textContent = "CONNECTING";
+      statusBadge.className = "badge reconnecting";
+    }
     idleView.classList.add("hidden");
     liveView.classList.remove("hidden");
     tabTitleEl.textContent = state.tabTitle || "(Untitled tab)";

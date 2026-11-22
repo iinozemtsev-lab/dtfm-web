@@ -37,7 +37,7 @@ cross:
 	done
 
 test-js:
-	node --test extension/test/e2ee.test.mjs extension/test/content.test.mjs
+	node --test extension/test/e2ee.test.mjs extension/test/content.test.mjs extension/test/background.test.mjs
 
 test: test-js
 	go test -v -race $(TEST_LDFLAGS) ./...

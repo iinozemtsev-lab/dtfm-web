@@ -5,6 +5,7 @@
   "description": "E2EE read-only single-tab browser bridge for remote AI agents",
   "permissions": [
     "activeTab",
+    "alarms",
     "scripting",
     "storage"
   ],

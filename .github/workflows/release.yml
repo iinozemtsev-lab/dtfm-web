@@ -79,9 +79,9 @@ jobs:
           cache: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Run quality gates
         run: |
@@ -93,7 +93,7 @@ jobs:
             exit 1
           fi
           go vet ./...
-          node --test extension/test/e2ee.test.mjs extension/test/content.test.mjs
+          node --test extension/test/e2ee.test.mjs extension/test/content.test.mjs extension/test/background.test.mjs
           go test -v -race ./...
           echo "✓ All pre-release quality gates passed."
 
